@@ -65,6 +65,12 @@ JIT builds are opt-in, require `kernel-builder`, CMake, Ninja, and a C++17
 compiler, and are cached under `$KERNELS_JIT_CACHE` (or the Hugging Face cache).
 The loader still prefers a compatible prebuilt variant when one exists.
 
+JIT requires a reproducible source revision. Kernels that publish only build
+artifacts, without source metadata or a `kernels-community` source mapping,
+cannot be compiled automatically; pass `JITOptions(source=...)` for such a
+kernel or use a compatible prebuilt variant. Runtime Python dependencies are
+not installed automatically.
+
 ## 📚 Documentation
 
 Read the [documentation of kernels](https://huggingface.co/docs/kernels/).
