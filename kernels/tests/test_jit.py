@@ -1,6 +1,7 @@
 import io
 import tarfile
 from pathlib import Path
+from types import SimpleNamespace
 
 import pytest
 
@@ -12,6 +13,7 @@ from kernels.jit import (
     JITOptions,
     _cache_key,
     _commit_from_source_url,
+    _is_cpu_variant,
     _normalize_source,
     _reject_unsupported_free_threaded_python,
     _resolve_source_commit,
@@ -75,6 +77,18 @@ def test_source_commit_requires_full_sha():
     assert _resolve_source_commit("a" * 40, None) == "a" * 40
     with pytest.raises(JITBuildError, match="40-character"):
         _resolve_source_commit("main", None)
+
+
+def test_cpu_variant_filter_handles_arch_and_noarch_variants():
+    cpu_arch = SimpleNamespace(arch=SimpleNamespace(backend=SimpleNamespace(name="cpu")))
+    cuda_arch = SimpleNamespace(arch=SimpleNamespace(backend=SimpleNamespace(name="cuda")))
+    cpu_noarch = SimpleNamespace(arch=SimpleNamespace(backend_name="cpu"))
+    other_noarch = SimpleNamespace(arch=SimpleNamespace(backend_name="cuda"))
+
+    assert _is_cpu_variant(cpu_arch)
+    assert _is_cpu_variant(cpu_noarch)
+    assert not _is_cpu_variant(cuda_arch)
+    assert not _is_cpu_variant(other_noarch)
 
 
 def test_source_subdir_rejects_traversal(tmp_path):

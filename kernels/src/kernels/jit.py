@@ -171,7 +171,11 @@ def _source_candidates(
         source, subdir = _normalize_source(options.source, options.source_subdir)
         return [_SourceSpec(source=source, subdir=subdir, commit=commit)]
 
-    variants = get_variants(api, repo_id=repo_id, revision=str(revision))
+    variants = [
+        variant
+        for variant in get_variants(api, repo_id=repo_id, revision=str(revision))
+        if _is_cpu_variant(variant)
+    ]
     variants = sorted(variants, key=_variant_sort_key, reverse=True)
 
     candidates: list[_SourceSpec] = []
@@ -216,6 +220,13 @@ def _source_candidates(
                 exc,
             )
             continue
+        if not isinstance(source, Path) and commit is None:
+            logger.warning(
+                "Ignoring JIT source metadata for %s (%s): no pinned source commit",
+                repo_id,
+                variant.variant_str,
+            )
+            continue
         key = (str(source), inferred_subdir, commit)
         if key in seen:
             continue
@@ -238,7 +249,11 @@ def _metadata_commit(
         return None
 
     variants = sorted(
-        get_variants(api, repo_id=repo_id, revision=str(revision)),
+        (
+            variant
+            for variant in get_variants(api, repo_id=repo_id, revision=str(revision))
+            if _is_cpu_variant(variant)
+        ),
         key=_variant_sort_key,
         reverse=True,
     )
@@ -273,6 +288,15 @@ def _variant_sort_key(variant) -> tuple[int, ...]:
         return tuple(int(part) for part in str(version).split("."))
     except ValueError:
         return (0,)
+
+
+def _is_cpu_variant(variant) -> bool:
+    """Return whether a variant targets the CPU backend."""
+
+    backend = getattr(variant.arch, "backend", None)
+    if backend is not None:
+        return getattr(backend, "name", None) == "cpu"
+    return getattr(variant.arch, "backend_name", None) == "cpu"
 
 
 def _resolve_source_commit(explicit: str | None, recorded: str | None) -> str | None:
