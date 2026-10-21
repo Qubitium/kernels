@@ -13,6 +13,7 @@ import sys
 import sysconfig
 import tarfile
 import tempfile
+import time
 import urllib.parse
 import urllib.request
 from dataclasses import dataclass, field
@@ -21,7 +22,7 @@ from typing import Iterator
 
 from huggingface_hub import HfApi, constants
 
-from kernels._rust import KernelDependency, Metadata, Oid
+from kernels._rust import KernelDependency, KernelVersion, Metadata, Oid
 from kernels._versions import resolve_kernel_version
 from kernels.backends import _select_backend
 from kernels.hf_hub import _check_trust_remote_code, _get_cache_dir
@@ -39,6 +40,8 @@ logger = logging.getLogger(__name__)
 _COMMIT_RE = re.compile(r"^[0-9a-f]{40}$")
 _GITHUB_KERNEL_SOURCE = "https://github.com/huggingface/kernels-community"
 _JIT_CACHE_VERSION = "1"
+_JIT_CACHE_ENTRY_VERSION = 1
+_JIT_CACHE_ENTRY_FILE = "jit.json"
 _IGNORE_SOURCE_PARTS = frozenset({"__pycache__", ".git", "build", "_cmake_build"})
 
 
@@ -53,13 +56,15 @@ class JITOptions:
     The source must be reproducible. For Hub kernels this is normally the
     source repository and commit recorded in the build metadata. ``source``
     can override the recorded source for kernels whose Hub metadata predates
-    source recording.
+    source recording. ``cache_ttl`` controls how long a cached build can be
+    reused without revalidating against the Hub.
     """
 
     source: str | Path | None = None
     source_subdir: str | None = None
     revision: str | None = None
     cache_dir: Path | None = None
+    cache_ttl: float | None = 3600.0
 
 
 @dataclass(frozen=True)
@@ -75,6 +80,16 @@ class JITResolver:
 
     options: JITOptions = field(default_factory=JITOptions)
     trust_remote_code: bool | list[str] = False
+
+    def resolve_cached(self, *, backend: str | None, kernel: KernelDependency) -> LocalKernel | None:
+        selected_backend = _select_backend(backend)
+        if selected_backend.name != "cpu":
+            return None
+        return _load_cached_kernel(
+            repo_id=kernel.repo_id,
+            requested=kernel.version,
+            options=self.options,
+        )
 
     def resolve(self, *, api: HfApi, backend: str | None, kernel: KernelDependency) -> LocalKernel:
         selected_backend = _select_backend(backend)
@@ -116,6 +131,7 @@ class JITResolver:
                     revision=revision,
                     source=candidate,
                     options=self.options,
+                    requested=kernel.version,
                 )
             except Exception as exc:
                 message = f"{candidate.source}@{candidate.commit or 'local'}: {exc}"
@@ -129,7 +145,7 @@ class JITResolver:
 
 @dataclass
 class FallbackResolver:
-    """Use ``fallback`` only when the primary resolver has no compatible build."""
+    """Prefer a cached fallback result, then use the fallback when the primary resolver has no compatible build."""
 
     primary: Resolver
     fallback: Resolver
@@ -137,6 +153,12 @@ class FallbackResolver:
     def resolve(
         self, *, api: HfApi, backend: str | None, kernel: KernelDependency
     ) -> LocalKernel | RemoteKernel | None:
+        resolve_cached = getattr(self.fallback, "resolve_cached", None)
+        if resolve_cached is not None:
+            cached = resolve_cached(backend=backend, kernel=kernel)
+            if cached is not None:
+                return cached
+
         try:
             return self.primary.resolve(api=api, backend=backend, kernel=kernel)
         except FileNotFoundError:
@@ -172,9 +194,7 @@ def _source_candidates(
         return [_SourceSpec(source=source, subdir=subdir, commit=commit)]
 
     variants = [
-        variant
-        for variant in get_variants(api, repo_id=repo_id, revision=str(revision))
-        if _is_cpu_variant(variant)
+        variant for variant in get_variants(api, repo_id=repo_id, revision=str(revision)) if _is_cpu_variant(variant)
     ]
     variants = sorted(variants, key=_variant_sort_key, reverse=True)
 
@@ -358,12 +378,98 @@ def _normalize_source(source: str | Path, subdir: str | None) -> tuple[str | Pat
     return repo, subdir
 
 
+def _requested_cache_key(version: KernelVersion) -> dict[str, str | int]:
+    if isinstance(version, KernelVersion.Version):
+        return {"kind": "version", "value": version.version}
+    if isinstance(version, KernelVersion.Revision):
+        return {"kind": "revision", "value": version.revision}
+    raise TypeError(f"Unsupported kernel version type: {type(version).__name__}")
+
+
+def _write_cache_entry(
+    *,
+    final_root: Path,
+    repo_id: str,
+    requested: KernelVersion,
+    revision: Oid,
+    source: _SourceSpec,
+    key: str,
+) -> None:
+    """Record the resolution metadata needed for a cache-first reload."""
+    payload = {
+        "version": _JIT_CACHE_ENTRY_VERSION,
+        "repo_id": repo_id,
+        "requested": _requested_cache_key(requested),
+        "revision": str(revision),
+        "source": str(source.source),
+        "source_is_local": isinstance(source.source, Path),
+        "source_subdir": source.subdir,
+        "source_commit": source.commit,
+        "key": key,
+        "validated_at": time.time(),
+    }
+    entry_path = final_root / _JIT_CACHE_ENTRY_FILE
+    fd, tmp_name = tempfile.mkstemp(
+        dir=final_root,
+        prefix=f".{_JIT_CACHE_ENTRY_FILE}.",
+        suffix=".tmp",
+    )
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8") as tmp_file:
+            json.dump(payload, tmp_file, sort_keys=True)
+            tmp_file.write("\n")
+        os.replace(tmp_name, entry_path)
+    except BaseException:
+        with contextlib.suppress(OSError):
+            os.unlink(tmp_name)
+        raise
+
+
+def _read_cache_entry(final_root: Path) -> dict | None:
+    try:
+        payload = json.loads((final_root / _JIT_CACHE_ENTRY_FILE).read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return None
+    if not isinstance(payload, dict) or payload.get("version") != _JIT_CACHE_ENTRY_VERSION:
+        return None
+    return payload
+
+
+def _cache_entry_is_fresh(payload: dict, ttl: float | None) -> bool:
+    if ttl is None:
+        return True
+    if ttl <= 0:
+        return False
+    validated_at = payload.get("validated_at")
+    if not isinstance(validated_at, (int, float)):
+        return False
+    return max(0.0, time.time() - validated_at) <= ttl
+
+
+def _local_kernel_from_variant(*, repo_id: str, revision: Oid, variant: Path) -> LocalKernel:
+    metadata = Metadata.read_from_file(variant / "metadata.json")
+    origin = None
+    try:
+        origin = RemoteKernel(
+            repo_id=repo_id,
+            revision=revision,
+            metadata=metadata,
+            variant=parse_variant(variant.name),
+        )
+    except ValueError:
+        # A locally generated variant name is still loadable; it just cannot be
+        # represented as a remote build variant.
+        pass
+    return LocalKernel(variant_path=variant, metadata=metadata, origin=origin)
+
+
 def _build_local_kernel(
     *,
     repo_id: str,
     revision: Oid,
     source: _SourceSpec,
     options: JITOptions,
+    requested: KernelVersion,
 ) -> LocalKernel:
     _reject_unsupported_free_threaded_python()
     cache_root = _jit_cache_root(options.cache_dir)
@@ -389,20 +495,19 @@ def _build_local_kernel(
             finally:
                 shutil.rmtree(build_parent, ignore_errors=True)
 
-    metadata = Metadata.read_from_file(variant / "metadata.json")
-    origin = None
     try:
-        origin = RemoteKernel(
+        _write_cache_entry(
+            final_root=final_root,
             repo_id=repo_id,
+            requested=requested,
             revision=revision,
-            metadata=metadata,
-            variant=parse_variant(variant.name),
+            source=source,
+            key=key,
         )
-    except ValueError:
-        # A locally generated variant name is still loadable; it just cannot be
-        # represented as a remote build variant.
-        pass
-    return LocalKernel(variant_path=variant, metadata=metadata, origin=origin)
+    except OSError as exc:
+        logger.warning("Could not write JIT cache metadata for %s: %s", final_root, exc)
+
+    return _local_kernel_from_variant(repo_id=repo_id, revision=revision, variant=variant)
 
 
 def _jit_cache_root(cache_dir: Path | None) -> Path:
@@ -481,6 +586,107 @@ def _load_cached_variant(final_root: Path) -> Path | None:
         return None
     path = build_root / variant.variant_str
     return path if (path / "metadata.json").is_file() else None
+
+
+def _load_cached_kernel(
+    *,
+    repo_id: str,
+    requested: KernelVersion,
+    options: JITOptions,
+) -> LocalKernel | None:
+    """Return a fresh local JIT build without contacting the Hub."""
+    if options.cache_ttl is not None and options.cache_ttl <= 0:
+        return None
+
+    requested_key = _requested_cache_key(requested)
+    normalized_source = None
+    if options.source is not None:
+        try:
+            normalized_source = _normalize_source(options.source, options.source_subdir)
+        except (JITBuildError, OSError):
+            return None
+
+    cache_root = _jit_cache_root(options.cache_dir)
+    matches: list[tuple[float, Path, Oid]] = []
+    try:
+        entries = list(cache_root.iterdir())
+    except OSError:
+        return None
+
+    for entry in entries:
+        if not entry.is_dir():
+            continue
+        payload = _read_cache_entry(entry)
+        if payload is None:
+            continue
+        if payload.get("repo_id") != repo_id or payload.get("requested") != requested_key:
+            continue
+        if not _cache_entry_is_fresh(payload, options.cache_ttl):
+            continue
+
+        if normalized_source is not None:
+            if payload.get("source") != str(normalized_source[0]):
+                continue
+            if payload.get("source_subdir") != normalized_source[1]:
+                continue
+        elif options.source_subdir is not None and payload.get("source_subdir") != options.source_subdir:
+            continue
+
+        if options.revision is not None:
+            if not _COMMIT_RE.fullmatch(options.revision):
+                return None
+            if payload.get("source_commit") != options.revision:
+                continue
+
+        revision_str = payload.get("revision")
+        source_str = payload.get("source")
+        source_subdir = payload.get("source_subdir")
+        source_commit = payload.get("source_commit")
+        source_is_local = payload.get("source_is_local")
+        if not isinstance(revision_str, str) or not _COMMIT_RE.fullmatch(revision_str):
+            continue
+        if not isinstance(source_str, str) or not isinstance(source_is_local, bool):
+            continue
+        if source_subdir is not None and not isinstance(source_subdir, str):
+            continue
+        if source_commit is not None and (
+            not isinstance(source_commit, str) or not _COMMIT_RE.fullmatch(source_commit)
+        ):
+            continue
+
+        source = _SourceSpec(
+            source=Path(source_str) if source_is_local else source_str,
+            subdir=source_subdir,
+            commit=source_commit,
+        )
+        try:
+            key = _cache_key(
+                repo_id=repo_id,
+                revision=Oid.from_str(revision_str),
+                source=source,
+            )
+        except (OSError, ValueError):
+            continue
+        if key != entry.name or payload.get("key") != key:
+            continue
+
+        variant = _load_cached_variant(entry)
+        if variant is None:
+            continue
+        validated_at = payload.get("validated_at")
+        matches.append(
+            (
+                float(validated_at) if isinstance(validated_at, (int, float)) else 0.0,
+                variant,
+                Oid.from_str(revision_str),
+            )
+        )
+
+    if not matches:
+        return None
+
+    _, variant, revision = max(matches, key=lambda match: match[0])
+    return _local_kernel_from_variant(repo_id=repo_id, revision=revision, variant=variant)
 
 
 def _materialize_source(source: _SourceSpec, destination: Path) -> Path:

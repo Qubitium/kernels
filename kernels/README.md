@@ -63,7 +63,11 @@ gptq = get_kernel(
 
 JIT builds are opt-in, require `kernel-builder`, CMake, Ninja, and a C++17
 compiler, and are cached under `$KERNELS_JIT_CACHE` (or the Hugging Face cache).
-The loader still prefers a compatible prebuilt variant when one exists.
+Cached builds are reused without Hub resolution for one hour by default. Set
+`JITOptions(cache_ttl=...)` to change the TTL, use `None` to disable expiry, or
+use `0` to disable the cache-first fast path. After the TTL expires, the loader
+revalidates the kernel and still prefers a compatible prebuilt variant when one
+exists.
 
 JIT requires a reproducible source revision. Kernels that publish only build
 artifacts, without source metadata or a `kernels-community` source mapping,
